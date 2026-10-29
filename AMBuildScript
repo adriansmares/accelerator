@@ -1,41 +1,46 @@
-# vim: set ts=2 sw=2 tw=99 noet ft=python: 
-import os, sys, shutil
+# vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
+import os, sys
 
-def ResolveEnvPath(env, folder=None):
+# Simple extensions do not need to modify this file.
+
+def ResolveEnvPath(env, folder):
   if env in os.environ:
     path = os.environ[env]
     if os.path.isdir(path):
       return path
     return None
 
-  if folder:
-    head = os.getcwd()
-    oldhead = None
-    while head != None and head != oldhead:
-      path = os.path.join(head, folder)
-      if os.path.isdir(path):
-        return path
-      oldhead = head
-      head, tail = os.path.split(head)
+  head = os.getcwd()
+  oldhead = None
+  while head != None and head != oldhead:
+    path = os.path.join(head, folder)
+    if os.path.isdir(path):
+      return path
+    oldhead = head
+    head, tail = os.path.split(head)
 
   return None
 
 def Normalize(path):
   return os.path.abspath(os.path.normpath(path))
 
-class AcceleratorConfig(object):
+def SetArchFlags(compiler):
+  if compiler.behavior == 'gcc':
+    if compiler.target.arch == 'x86_64':
+      compiler.cflags += ['-fPIC']
+  elif compiler.like('msvc'):
+    if compiler.target.arch == 'x86_64':
+      compiler.defines += ['WIN64']
+
+class ExtensionConfig(object):
   def __init__(self):
+    self.binaries = []
+    self.extensions = []
+    self.generated_headers = None
     self.mms_root = None
     self.sm_root = None
-    self.extension = None
-    self.libz = None
-    self.libbreakpad_client = None
-    self.libbreakpad = None
-    self.libdisasm = None
-    self.targets = []
+    self.all_targets = []
     self.target_archs = set()
-    self.breakpad_config = dict()
-    self.breakpad_patch = None
 
     if builder.options.targets:
       target_archs = builder.options.targets.split(',')
@@ -47,35 +52,74 @@ class AcceleratorConfig(object):
             cxx = builder.DetectCxx(target_arch = arch)
             self.target_archs.add(cxx.target.arch)
         except Exception as e:
+            # Error if archs were manually overridden.
             if builder.options.targets:
                 raise
             print('Skipping target {}: {}'.format(arch, e))
             continue
-        self.targets.append(cxx)
+        self.all_targets.append(cxx)
 
-    if not self.targets:
-      raise Exception('No suitable C/C++ compiler was found.')
-  
+    if not self.all_targets:
+        raise Exception('No suitable C/C++ compiler was found.')
+
   @property
   def tag(self):
     if builder.options.debug == '1':
       return 'Debug'
     return 'Release'
-  
-  def retrieve_sm(self):
+
+  def detectSDKs(self):
+    if builder.options.mms_path:
+      self.mms_root = builder.options.mms_path
+    else:
+      self.mms_root = ResolveEnvPath('MMSOURCE112', 'mmsource-1.12')
+      if not self.mms_root:
+        self.mms_root = ResolveEnvPath('MMSOURCE', 'metamod-source')
+      if not self.mms_root:
+        self.mms_root = ResolveEnvPath('MMSOURCE_DEV', 'metamod-source')
+      if not self.mms_root:
+        self.mms_root = ResolveEnvPath('MMSOURCE_DEV', 'mmsource-central')
+
+    if not self.mms_root or not os.path.isdir(self.mms_root):
+      raise Exception('Could not find a source copy of Metamod:Source')
+    self.mms_root = Normalize(self.mms_root)
+
     if builder.options.sm_path:
       self.sm_root = builder.options.sm_path
     else:
-      self.sm_root = ResolveEnvPath('SOURCEMOD', 'sourcemod')
+      self.sm_root = ResolveEnvPath('SOURCEMOD112', 'sourcemod-1.12')
+      if not self.sm_root:
+        self.sm_root = ResolveEnvPath('SOURCEMOD', 'sourcemod')
+      if not self.sm_root:
+        self.sm_root = ResolveEnvPath('SOURCEMOD_DEV', 'sourcemod')
+      if not self.sm_root:
+        self.sm_root = ResolveEnvPath('SOURCEMOD_DEV', 'sourcemod-central')
 
     if not self.sm_root or not os.path.isdir(self.sm_root):
       raise Exception('Could not find a source copy of SourceMod')
     self.sm_root = Normalize(self.sm_root)
+
+  def configure(self):
     
-  def use_auto_versioning(self):
-    return not builder.options.disable_auto_versioning
-  
+    allowed_archs = ['x86','x86_64']
+
+    if not set(self.target_archs).issubset(allowed_archs):
+      raise Exception('Unknown target architecture: {0}'.format(self.target_archs))
+
+    for cxx in self.all_targets:
+        self.configure_cxx(cxx)
+
   def configure_cxx(self, cxx):
+    if cxx.family == 'msvc':
+      if cxx.version < 1914 and builder.options.generator != 'vs':
+        raise Exception(f'Only MSVC 2017 15.7 and later are supported, full C++17 support is required. ({str(cxx.version)} < 1914)')
+    elif cxx.family == 'gcc':
+      if cxx.version < 'gcc-8':
+        raise Exception('Only GCC versions 8 or later are supported, full C++17 support is required.')
+    elif cxx.family == 'clang':
+      if cxx.version < 'clang-5':
+        raise Exception('Only clang versions 5 or later are supported, full C++17 support is required.')
+
     if cxx.like('gcc'):
       self.configure_gcc(cxx)
     elif cxx.family == 'msvc':
@@ -92,126 +136,187 @@ class AcceleratorConfig(object):
     # Platform-specifics
     if cxx.target.platform == 'linux':
       self.configure_linux(cxx)
+    elif cxx.target.platform == 'mac':
+      self.configure_mac(cxx)
     elif cxx.target.platform == 'windows':
       self.configure_windows(cxx)
 
-    if self.use_auto_versioning():
-      cxx.defines += ['GIT_ACTION_BUILD']
-  
   def configure_gcc(self, cxx):
+    cxx.defines += [
+      'stricmp=strcasecmp',
+      '_stricmp=strcasecmp',
+      '_snprintf=snprintf',
+      '_vsnprintf=vsnprintf',
+      'HAVE_STDINT_H',
+      'GNUC',
+    ]
     cxx.cflags += [
-      '-fPIC',
       '-pipe',
       '-fno-strict-aliasing',
-      '-fvisibility=hidden',
-      '-fvisibility-inlines-hidden',
       '-Wall',
       '-Werror',
-      '-msse'
+      '-Wno-unused',
+      '-Wno-switch',
+      '-Wno-array-bounds',
+      '-fvisibility=hidden',
     ]
+  
+    if cxx.target.arch in ['x86', 'x86_64']:
+      cxx.cflags += ['-msse']
 
     cxx.cxxflags += [
-      '-std=c++20',
       '-fno-threadsafe-statics',
       '-Wno-non-virtual-dtor',
       '-Wno-overloaded-virtual',
-      '-Wno-implicit-exception-spec-mismatch'
+      '-Wno-register',
+      '-fvisibility-inlines-hidden',
+      '-std=c++20',
     ]
 
-    cxx.postlink += ['-pthread', '-Wl,-z,noexecstack']
+    have_gcc = cxx.family == 'gcc'
+    have_clang = cxx.family == 'clang'
+
+    # Work around errors from smsdk_ext.cpp
+    if have_clang:
+      cxx.cxxflags += ['-Wno-implicit-exception-spec-mismatch']
+
+    # Work around SDK warnings.
+    if cxx.version >= 'clang-10.0' or cxx.version >= 'apple-clang-12.0':
+        cxx.cflags += [
+            '-Wno-implicit-int-float-conversion',
+            '-Wno-tautological-overlap-compare',
+        ]
+
+    if have_gcc:
+      cxx.cflags += ['-mfpmath=sse']
+      cxx.cflags += ['-Wno-maybe-uninitialized']
 
     if builder.options.opt == '1':
-      cxx.cflags += ['-O3']
-    return
+        cxx.cflags += ['-O3']
+
+    # Don't omit the frame pointer.
+    cxx.cflags += ['-fno-omit-frame-pointer']
 
   def configure_msvc(self, cxx):
 
+    if builder.options.debug == '1':
+      cxx.cflags += ['/MTd']
+      cxx.linkflags += ['/NODEFAULTLIB:libcmt']
+    else:
+      cxx.cflags += ['/MT']
+    cxx.defines += [
+      '_CRT_SECURE_NO_DEPRECATE',
+      '_CRT_SECURE_NO_WARNINGS',
+      '_CRT_NONSTDC_NO_DEPRECATE',
+      '_ITERATOR_DEBUG_LEVEL=0',
+    ]
+    cxx.cflags += [
+      '/W3',
+    ]
     cxx.cxxflags += [
       '/EHsc',
-      '/std:c++20'
+      '/GR-',
+      '/TP',
+      '/std:c++20',
+    ]
+    cxx.linkflags += [
+      'kernel32.lib',
+      'user32.lib',
+      'gdi32.lib',
+      'winspool.lib',
+      'comdlg32.lib',
+      'advapi32.lib',
+      'shell32.lib',
+      'ole32.lib',
+      'oleaut32.lib',
+      'uuid.lib',
+      'odbc32.lib',
+      'odbccp32.lib',
     ]
 
-    return
-  
+    if builder.options.opt == '1':
+      cxx.cflags += ['/Ox', '/Zo']
+      cxx.linkflags += ['/OPT:ICF', '/OPT:REF']
+
+    if builder.options.debug == '1':
+      cxx.cflags += ['/Od', '/RTC1']
+
+    # This needs to be after our optimization flags which could otherwise disable it.
+    # Don't omit the frame pointer.
+    cxx.cflags += ['/Oy-']
+
   def configure_linux(self, cxx):
-    cxx.defines += ['_LINUX', 'POSIX', '_GLIBCXX_USE_CXX11_ABI=0']
-    return
-  
+    cxx.defines += ['LINUX', '_LINUX', 'POSIX', '_FILE_OFFSET_BITS=64']
+    cxx.linkflags += ['-lm']
+    if cxx.family == 'gcc':
+      cxx.linkflags += ['-static-libgcc']
+    elif cxx.family == 'clang':
+      cxx.linkflags += ['-lgcc_eh']
+    cxx.linkflags += ['-static-libstdc++']
+
+  def configure_mac(self, cxx):
+    cxx.defines += ['OSX', '_OSX', 'POSIX', 'KE_ABSOLUTELY_NO_STL']
+    cxx.cflags += ['-mmacosx-version-min=10.15']
+    cxx.linkflags += [
+      '-mmacosx-version-min=10.15',
+      '-stdlib=libc++',
+      '-lc++',
+    ]
+    cxx.cxxflags += ['-stdlib=libc++']
+
   def configure_windows(self, cxx):
-    cxx.defines += ['_WINDOWS']
-    if cxx.target.arch == 'x86':
-      cxx.defines += ['WIN32']
-    elif cxx.target.arch == 'x86_64':
-      cxx.defines += ['WIN64']
-    return
-  
-  def configure(self):
-    self.retrieve_sm()
-
-    for cxx in self.targets:
-      self.configure_cxx(cxx)
-
-  def configure_extension(self, compiler, context):
+    cxx.defines += ['WIN32', '_WINDOWS']
+	
+  def ConfigureForExtension(self, context, compiler):
     compiler.cxxincludes += [
       os.path.join(context.currentSourcePath),
+      os.path.join(context.currentSourcePath, 'sdk'),
       os.path.join(self.sm_root, 'public'),
       os.path.join(self.sm_root, 'public', 'extensions'),
+      os.path.join(self.sm_root, 'sourcepawn', 'include'),
       os.path.join(self.sm_root, 'public', 'amtl', 'amtl'),
       os.path.join(self.sm_root, 'public', 'amtl'),
-      os.path.join(self.sm_root, 'sourcepawn', 'include'),
-      os.path.join(self.sm_root, 'sourcepawn', 'vm'),
-      os.path.join(self.sm_root, 'sourcepawn')
+    ]
+    return compiler
+
+  def ConfigureForHL2(self, binary):
+    compiler = binary.compiler
+    SetArchFlags(compiler)
+
+    compiler.cxxincludes += [
+      os.path.join(self.mms_root, 'core'),
+      os.path.join(self.mms_root, 'core', 'sourcehook'),
     ]
 
-  def link_libz(self, compiler, context):
-    for task in self.libz:
-      if task.target.arch == compiler.target.arch:
-        compiler.postlink += [os.path.join(context.buildPath, task.binary.path)]
-        compiler.linkdeps += [task.binary]
-        return
-    raise Exception('No suitable build of libz was found.')
-
-  def link_libbreakpad_client(self, compiler, context):
-    for task in self.libbreakpad_client:
-      if task.target.arch == compiler.target.arch:
-        compiler.postlink += [os.path.join(context.buildPath, task.binary.path)]
-        compiler.linkdeps += [task.binary]
-        return
-    raise Exception('No suitable build of libbreakpad_client was found.')
-  
-  def link_libbreakpad(self, compiler, context):
-    for task in self.libbreakpad:
-      if task.target.arch == compiler.target.arch:
-        compiler.postlink += [os.path.join(context.buildPath, task.binary.path)]
-        compiler.linkdeps += [task.binary]
-        return
-    raise Exception('No suitable build of libbreakpad was found.')
-  
-  def link_libdisasm(self, compiler, context):
-    for task in self.libdisasm:
-      if task.target.arch == compiler.target.arch:
-        compiler.postlink += [os.path.join(context.buildPath, task.binary.path)]
-        compiler.linkdeps += [task.binary]
-        return
-    raise Exception('No suitable build of libdisasm was found.')
-
-  def ConfigureLibrary(self, project, compiler, context):
-    binary = project.Configure(compiler, project.name, '{0} - {1}'.format(self.tag, compiler.target.arch))
-    binary.compiler.cxxincludes += [
-      os.path.join(context.currentSourcePath)
-    ]
-    return binary
-  
-  def ConfigureExtension(self, project, compiler, context):
-    binary = self.ConfigureLibrary(project, compiler, context)
-    self.configure_extension(binary.compiler, context)
+    compiler.defines += ['META_NO_HL2SDK']
     return binary
 
-Accelerator = AcceleratorConfig()
-Accelerator.configure()
+  def HL2Library(self, context, name):
+    binary = context.compiler.Library(name)
+    self.ConfigureForExtension(context, binary.compiler)
+    return self.ConfigureForHL2(binary)
 
-builder.Build(['third_party/Patch', 'third_party/Configure', 'third_party/AMBuilder'], { 'Accelerator': Accelerator })
+  def HL2Project(self, context, name):
+    project = builder.LibraryProject(name)
+    return project
 
-BuildScripts = ['extension/AMBuilder', 'buildbot/PackageScript']
-builder.Build(BuildScripts, { 'Accelerator': Accelerator })
+  def HL2Config(self, context, project, name, compiler):
+    binary = project.Configure(compiler, name, '{0} - {1}'.format(self.tag, compiler.target.arch))
+    self.ConfigureForExtension(context, binary.compiler)
+    return self.ConfigureForHL2(binary)
 
+Extension = ExtensionConfig()
+Extension.detectSDKs()
+Extension.configure()
+
+# This will clone the list and each cxx object as we recurse, preventing child
+# scripts from messing up global state.
+builder.targets = builder.CloneableList(Extension.all_targets)
+
+# Add additional buildscripts here
+BuildScripts = [
+  'AMBuilder',
+  'PackageScript',
+]
+
+builder.Build(BuildScripts, { 'Extension': Extension })

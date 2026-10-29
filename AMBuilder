@@ -1,0 +1,108 @@
+# vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
+import os
+
+projectName = 'accelerator'
+
+sourceFiles = [
+  'extension/extension.cpp',
+  'extension/MemoryDownloader.cpp',
+  'extension/forwards.cpp',
+  'extension/natives.cpp',
+]
+
+for cxx in builder.targets:
+  if cxx.like('gcc'):
+    # Exception: carried over from upstream's build. Breakpad's static libraries are linked into the extension.
+    cxx.cflags += ['-fPIC']
+    cxx.postlink += ['-pthread', '-Wl,-z,noexecstack']
+  if cxx.target.platform == 'linux':
+    # Exception: carried over from upstream's build; SourceMod does not set it.
+    cxx.defines += ['_GLIBCXX_USE_CXX11_ABI=0']
+
+# Breakpad and zlib are built by the scripts in third_party, which take this object.
+class BreakpadConfig(object):
+  def __init__(self):
+    self.targets = builder.targets
+    self.breakpad_config = dict()
+    self.breakpad_patch = None
+    self.libz = None
+    self.libbreakpad_client = None
+    self.libbreakpad = None
+    self.libdisasm = None
+
+  def ConfigureLibrary(self, project, compiler, context):
+    binary = project.Configure(compiler, project.name, '{0} - {1}'.format(Extension.tag, compiler.target.arch))
+    binary.compiler.cxxincludes += [
+      os.path.join(context.currentSourcePath)
+    ]
+    return binary
+
+  def link(self, libraries, name, compiler, context):
+    for task in libraries:
+      if task.target.arch == compiler.target.arch:
+        compiler.postlink += [os.path.join(context.buildPath, task.binary.path)]
+        compiler.linkdeps += [task.binary]
+        return
+    raise Exception('No suitable build of {} was found.'.format(name))
+
+  def link_libz(self, compiler, context):
+    self.link(self.libz, 'libz', compiler, context)
+
+  def link_libbreakpad_client(self, compiler, context):
+    self.link(self.libbreakpad_client, 'libbreakpad_client', compiler, context)
+
+  def link_libbreakpad(self, compiler, context):
+    self.link(self.libbreakpad, 'libbreakpad', compiler, context)
+
+  def link_libdisasm(self, compiler, context):
+    self.link(self.libdisasm, 'libdisasm', compiler, context)
+
+Accelerator = BreakpadConfig()
+builder.Build(['third_party/Patch', 'third_party/Configure', 'third_party/AMBuilder'], { 'Accelerator': Accelerator })
+
+def AddSourceFilesFromDir(path, files):
+  return [os.path.join(path, file) for file in files]
+
+project = Extension.HL2Project(builder, projectName + '.ext')
+project.sources += [os.path.join(Extension.sm_root, 'public', 'smsdk_ext.cpp')]
+project.sources += sourceFiles
+
+for cxx in builder.targets:
+  binary = Extension.HL2Config(builder, project, projectName + '.ext', cxx)
+  compiler = binary.compiler
+  compiler.sourcedeps += Accelerator.breakpad_patch
+  compiler.sourcedeps += Accelerator.breakpad_config[compiler.target.arch]
+  compiler.defines += ['HAVE_CONFIG_H']
+  compiler.cxxincludes += [
+    os.path.join(builder.sourcePath, 'extension'),
+    os.path.join(builder.sourcePath, 'third_party', 'breakpad', 'src'),
+    os.path.join(builder.buildPath, 'third_party', 'config', compiler.target.arch),
+    # Exception: accelerator reads plugin runtime internals from SourcePawn's VM headers.
+    os.path.join(Extension.sm_root, 'sourcepawn', 'vm'),
+    os.path.join(Extension.sm_root, 'sourcepawn'),
+  ]
+  if compiler.target.platform == 'linux':
+    binary.sources += AddSourceFilesFromDir(os.path.join(builder.sourcePath, 'third_party', 'breakpad', 'src', 'common'), [
+      'dwarf_cfi_to_module.cc',
+      'dwarf_cu_to_module.cc',
+      'dwarf_line_to_module.cc',
+      'dwarf_range_list_handler.cc',
+      'language.cc',
+      'module.cc',
+      'path_helper.cc',
+      'stabs_reader.cc',
+      'stabs_to_module.cc',
+      'dwarf/bytereader.cc',
+      'dwarf/dwarf2diehandler.cc',
+      'dwarf/dwarf2reader.cc',
+      'dwarf/elf_reader.cc',
+      'linux/crc32.cc',
+      'linux/dump_symbols.cc',
+      'linux/elf_symbols_to_module.cc',
+      'linux/breakpad_getcontext.S',
+    ])
+  Accelerator.link_libbreakpad_client(compiler, builder)
+  Accelerator.link_libbreakpad(compiler, builder)
+  Accelerator.link_libdisasm(compiler, builder)
+
+Extension.extensions += builder.Add(project)
